@@ -1,7 +1,7 @@
 ; Tim Follin's Star Tip 2 ported to the Commodore PET by David Given
 ; The music is Follin's, the code is mine. My bits are CC0. Enjoy.
 ; BBC Micro port by Negative Charge, June 2025.
-; Assemble with beebasm.
+; Assemble with BeebAsm.
 
 SHEILABASE              = $FE00             ; System peripherals
 SYSVIA_DDRA             = SHEILABASE + $43  ; Data direction register A
@@ -10,7 +10,7 @@ SYSVIA_REGB             = SHEILABASE + $40  ; Port B I/O
 SYSVIA_REGA             = SHEILABASE + $41  ; Port A I/O
 
 MAX_PULSE_LEN           = 16
-TICKS_PER_VOL_STEP      = 10
+TICKS_PER_VOL_STEP      = 8
 
 org 0
 .ptr           equw 0
@@ -27,35 +27,35 @@ org 0
 .duration      equw 0
 .etimer        equb 0
 .decay         equb 0
+.cycle_balance equb 0
 
 org &1100
 guard &7c00
 
 .start
     
-; Write data to sound chip then add processing delay
-macro sound_write_slow
+macro sound_write
    sta SYSVIA_ORAS        ;4 Write reg/data to SN76489
-
+   
    lda #%00000000         ;2
    sta SYSVIA_REGB        ;4 
    nop                    ;2
    nop                    ;2
    nop                    ;2
    lda #%00001000         ;2
-   sta SYSVIA_REGB        ;4
+   sta SYSVIA_REGB        ;4 = 16 cycles
 endmacro
 
 macro RESET_SOUND_CHIP
    ; Zero volumes on all SN76489 channels, just in case anything already playing
    lda #%11111111
-   sound_write_slow                                ; Channel 3 (Noise)
+   sound_write                            ; Channel 3 (Noise)
    lda #%11011111
-   sound_write_slow                                ; Channel 2
+   sound_write                            ; Channel 2
    lda #%10111111
-   sound_write_slow                                ; Channel 1
+   sound_write                            ; Channel 1
    lda #%10011111
-   sound_write_slow                                ; Channel 0
+   sound_write                            ; Channel 0
 endmacro
 
    ; Set up audio
@@ -70,9 +70,9 @@ endmacro
 
    ; Period to 1 on all tone channel 0
    lda #%10000001
-   sound_write_slow                                
+   sound_write                                
    lda #%00000000
-   sound_write_slow                                
+   sound_write                                
     
    ; System VIA Port B, place accumulator on wires, no handshake
    lda #%00000000         
@@ -156,31 +156,44 @@ endmacro
 
 macro process_note var, offset
 {
-   dec var            ; 5
-   bne exit           ; 2
+   dec var                    ; 5
+   bne exit                   ; 2
 
-   lda #%10010000     ; 2 Channel 0: volume only
-   sta SYSVIA_ORAS    ; 4 Write to SN76489 Channel 0
+   ; Calculate balanced on/off times
+   lda pulse_length           ; 3
+   sta cycle_balance          ; 3
+   
+   ; ON phase - sound enabled
+   lda #%10010000             ; 2 Channel 0: volume only
+   sta SYSVIA_ORAS            ; 4 Write to SN76489 Channel 0
 
-   ldx pulse_length   ; 3
-.loop1
-   dex                ; 2
-   bne loop1          ; 2
-
-   lda #%10011111     ; 2 Channel 0: volume only
-   sta SYSVIA_ORAS    ; 4 Write to SN76489 Channel 0
+   ; Balanced ON delay using cycle_balance
+   ldx cycle_balance          ; 3
+.on_loop
+   nop                        ; 2 per iteration
+   dex                        ; 2 per iteration  
+   bne on_loop                ; 2 per iteration (except last)
+   
+   ; OFF phase - sound muted
+   lda #%10011111             ; 2 Channel 0: volume muted
+   sta SYSVIA_ORAS            ; 4 Write to SN76489 Channel 0
     
-   sec                ; 2
-   lda #MAX_PULSE_LEN ; 2
-   sbc pulse_length   ; 3
-   tax                ; 2
-.loop2
-   dex                ; 2
-   bne loop2          ; 2
+   ; Balanced OFF delay - complement of ON time
+   sec                        ; 2
+   lda #MAX_PULSE_LEN         ; 2
+   sbc cycle_balance          ; 3
+   tax                        ; 2
+   beq skip_off_loop          ; 2 (branch if zero cycles needed)
+.off_loop
+   nop                        ; 2 per iteration
+   dex                        ; 2 per iteration
+   bne off_loop               ; 2 per iteration (except last)
+.skip_off_loop
 
-   ldy #offset        ; 2
-   lda (ptr), y       ; 5
-   sta var            ; 3
+   ; Load next note value
+   ldy #offset                ; 2
+   lda (ptr), y               ; 5
+   sta var                    ; 3
 .exit
 }
 endmacro
@@ -197,28 +210,30 @@ endmacro
       sta etimer
       lda attack_flag
       bne attack_flag_is_set
-         dec decay         ; 5
-         bne not_etimer    ; 2
+         ; Decay phase - reduce pulse width
+         dec decay              ; 5
+         bne not_etimer         ; 2
 
-         lda note_decay    ; 3
-         sta decay         ; 3
+         lda note_decay         ; 3
+         sta decay              ; 3
 
-         ldx pulse_length  ; 3
-         dex               ; 2
-         cpx note_volume   ; 3
-         beq not_etimer    ; 2
+         ldx pulse_length       ; 3
+         dex                    ; 2
+         cpx note_volume        ; 3
+         beq not_etimer         ; 2
 
          stx pulse_length
-         bne not_etimer    ; pulse_length is never 0
+         bne not_etimer         ; pulse_length is never 0
       .attack_flag_is_set
-         dec attack        ; 5
-         bne not_etimer    ; 2
+         ; Attack phase - increase pulse width
+         dec attack             ; 5
+         bne not_etimer         ; 2
 
-         lda note_attack   ; 3
-         sta attack        ; 3
+         lda note_attack        ; 3
+         sta attack             ; 3
 
-         ldx pulse_length  ; 3
-         inx               ; 2
+         ldx pulse_length       ; 3
+         inx                    ; 2
          stx pulse_length
          cpx #MAX_PULSE_LEN-1
          bne not_etimer
@@ -243,14 +258,14 @@ endmacro
 
 macro envelope len, attack, decay, volume
    equb &ff
-   equw len * 3/2
+   equw len * 4/3
    equb attack+1, decay+1, volume
 endmacro
 
 macro note a, b, c
-   equb a/2
-   equb b/2
-   equb c/2
+   equb a
+   equb b
+   equb c
 endmacro
 
 .music_data
